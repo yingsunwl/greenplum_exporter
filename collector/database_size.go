@@ -4,12 +4,11 @@ import (
 	"container/list"
 	"context"
 	"database/sql"
+	"github.com/prometheus/client_golang/prometheus"
+	logger "github.com/prometheus/common/log"
 	"os"
 	"strings"
 	"time"
-
-	"github.com/prometheus/client_golang/prometheus"
-	logger "github.com/prometheus/common/log"
 )
 
 /**
@@ -17,6 +16,7 @@ import (
  */
 
 const (
+	databaseListSql = `SELECT datname as database_name FROM pg_database WHERE datistemplate != true;`
 	databaseSizeSql = `SELECT sodddatname as database_name,sodddatsize/(1024*1024) as database_size_mb from gp_toolkit.gp_size_of_database;`
 	tableCountSql   = `SELECT count(*) as total from information_schema.tables where table_schema not in ('gp_toolkit','information_schema','pg_catalog');`
 	bloatTableSql   = `
@@ -97,10 +97,38 @@ var (
 		nil,
 		nil,
 	)
+
+	lastGetDatabaseSizeTime int64 = 0
+	dbSizeMap                     = make(map[string]float64)
+	dbTablesMap                   = make(map[string]*DbTables)
 )
 
 func NewDatabaseSizeScraper() Scraper {
 	return databaseSizeScraper{}
+}
+
+type DbTables struct {
+	count       float64
+	bloatTables *list.List
+	skewTables  *list.List
+	updateTime  int64
+}
+
+type BloatTable struct {
+	dbname     string
+	schema     string
+	table      string
+	relpages   string
+	exppages   string
+	bloatstate float64
+}
+
+type SkewTable struct {
+	dbname string
+	schema string
+	table  string
+	size   string
+	slope  float64
 }
 
 type databaseSizeScraper struct{}
@@ -111,12 +139,12 @@ func (databaseSizeScraper) Name() string {
 
 func (databaseSizeScraper) Scrape(db *sql.DB, ch chan<- prometheus.Metric, ver int) error {
 	ctx := context.Background()
-	ctx, cancel := context.WithTimeout(ctx, time.Second*10)
+	ctx, cancel := context.WithTimeout(ctx, time.Second*2)
 
 	defer cancel()
 
-	logger.Infof("Query Database: %s", databaseSizeSql)
-	rows, err := db.QueryContext(ctx, databaseSizeSql)
+	logger.Infof("Query Database: %s", databaseListSql)
+	rows, err := db.Query(databaseListSql)
 	if err != nil {
 		return err
 	}
@@ -126,11 +154,22 @@ func (databaseSizeScraper) Scrape(db *sql.DB, ch chan<- prometheus.Metric, ver i
 	errs := make([]error, 0)
 
 	names := list.New()
+	now := time.Now().Unix()
+	if (now - 3600*12) > lastGetDatabaseSizeTime {
+		go getDatabaseSizes(db)
+		lastGetDatabaseSizeTime = now
+	}
+
 	for rows.Next() {
 		var dbname string
 		var mbSize float64
 
-		err := rows.Scan(&dbname, &mbSize)
+		err := rows.Scan(&dbname)
+
+		size, ok := dbSizeMap[dbname]
+		if ok {
+			mbSize = size
+		}
 
 		if err != nil {
 			errs = append(errs, err)
@@ -143,13 +182,11 @@ func (databaseSizeScraper) Scrape(db *sql.DB, ch chan<- prometheus.Metric, ver i
 
 	for item := names.Front(); nil != item; item = item.Next() {
 		dbname := item.Value.(string)
-		count, err := queryTablesCount(dbname, ch)
+		err := getTableInfo(dbname, ch)
 		if err != nil {
 			errs = append(errs, err)
 			continue
 		}
-
-		ch <- prometheus.MustNewConstMetric(tablesCountDesc, prometheus.GaugeValue, count, dbname)
 	}
 
 	errM := queryHitCacheRate(db, ch)
@@ -165,7 +202,60 @@ func (databaseSizeScraper) Scrape(db *sql.DB, ch chan<- prometheus.Metric, ver i
 	return combineErr(errs...)
 }
 
-func queryTablesCount(dbname string, ch chan<- prometheus.Metric) (count float64, err error) {
+func getDatabaseSizes(db *sql.DB) error {
+	logger.Infof("Query Database: %s", databaseSizeSql)
+
+	rows, err := db.Query(databaseSizeSql)
+	if err != nil {
+		return err
+	}
+
+	defer rows.Close()
+
+	errs := make([]error, 0)
+	for rows.Next() {
+		var dbname string
+		var mbSize float64
+
+		err := rows.Scan(&dbname, &mbSize)
+
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+
+		logger.Infof("--> DB size: db=%s size=%f mb", dbname, mbSize)
+
+		dbSizeMap[dbname] = mbSize
+	}
+	return combineErr(errs...)
+}
+
+func getTableInfo(dbname string, ch chan<- prometheus.Metric) (err error) {
+	dbTables, ok := dbTablesMap[dbname]
+	var lastUpdateTime int64 = 0
+	if ok {
+		ch <- prometheus.MustNewConstMetric(tablesCountDesc, prometheus.GaugeValue, dbTables.count, dbname)
+		for i := dbTables.bloatTables.Front(); i != nil; i = i.Next() {
+			s := i.Value.(BloatTable)
+			ch <- prometheus.MustNewConstMetric(bloatTableDesc, prometheus.GaugeValue, s.bloatstate, s.dbname, s.schema, s.table, s.relpages, s.exppages)
+		}
+		for i := dbTables.skewTables.Front(); i != nil; i = i.Next() {
+			s := i.Value.(SkewTable)
+			ch <- prometheus.MustNewConstMetric(skewTableDesc, prometheus.GaugeValue, s.slope, s.dbname, s.schema, s.table, s.size)
+		}
+		lastUpdateTime = dbTables.updateTime
+	}
+	now := time.Now().Unix()
+	if (now - 5*60) > lastUpdateTime {
+		go queryTablesCount(dbname)
+	}
+	return
+}
+
+func queryTablesCount(dbname string) (err error) {
+	dbTables := new(DbTables)
+
 	dataSourceName := os.Getenv("GPDB_DATA_SOURCE_URL")
 	newDataSourceName := strings.Replace(dataSourceName, "/postgres", "/"+dbname, 1)
 	logger.Infof("Connection string is : %s", newDataSourceName)
@@ -189,29 +279,31 @@ func queryTablesCount(dbname string, ch chan<- prometheus.Metric) (count float64
 	defer rows.Close()
 
 	for rows.Next() {
-		errC := rows.Scan(&count)
+		errC := rows.Scan(&dbTables.count)
 		if errC != nil {
 			err = errC
 			return
 		}
 	}
 
-	// errD := queryBloatTables(conn, ch)
-	// if errD != nil {
-	// 	err=errD
-	// 	return
-	// }
+	errD := queryBloatTables(dbTables, conn)
+	if errD != nil {
+		err = errD
+		return
+	}
 
-	// errF := querySkewTables(conn, ch)
-	// if errF != nil {
-	// 	err = errF
-	// 	return
-	// }
+	errF := querySkewTables(dbTables, conn)
+	if errF != nil {
+		err = errF
+		return
+	}
 
+	dbTables.updateTime = time.Now().Unix()
+	dbTablesMap[dbname] = dbTables
 	return
 }
 
-func queryBloatTables(conn *sql.DB, ch chan<- prometheus.Metric) error {
+func queryBloatTables(dbTables *DbTables, conn *sql.DB) error {
 	rows, err := conn.Query(bloatTableSql)
 	logger.Infof("Query bloat tables sql: %s", bloatTableSql)
 
@@ -222,23 +314,22 @@ func queryBloatTables(conn *sql.DB, ch chan<- prometheus.Metric) error {
 	defer rows.Close()
 
 	errs := make([]error, 0)
-
+	dbTables.bloatTables = list.New()
 	for rows.Next() {
-		var dbname, schema, table, relpages, exppages string
-		var bloatstate float64
-		err = rows.Scan(&dbname, &schema, &table, &relpages, &exppages, &bloatstate)
+		var bloatTable BloatTable
+		err = rows.Scan(&bloatTable.dbname, &bloatTable.schema, &bloatTable.table,
+			&bloatTable.relpages, &bloatTable.exppages, &bloatTable.bloatstate)
 		if err != nil {
 			errs = append(errs, err)
 			continue
 		}
-
-		ch <- prometheus.MustNewConstMetric(bloatTableDesc, prometheus.GaugeValue, bloatstate, dbname, schema, table, relpages, exppages)
+		dbTables.bloatTables.PushBack(bloatTable)
 	}
 
 	return combineErr(errs...)
 }
 
-func querySkewTables(conn *sql.DB, ch chan<- prometheus.Metric) error {
+func querySkewTables(dbTables *DbTables, conn *sql.DB) error {
 	rows, err := conn.Query(skewTableSql)
 	logger.Infof("Query skew tables sql: %s", skewTableSql)
 
@@ -249,17 +340,15 @@ func querySkewTables(conn *sql.DB, ch chan<- prometheus.Metric) error {
 	defer rows.Close()
 
 	errs := make([]error, 0)
-
+	dbTables.skewTables = list.New()
 	for rows.Next() {
-		var dbname, schema, table, size string
-		var slope float64
-		err = rows.Scan(&dbname, &schema, &table, &slope, &size)
+		var skewTable SkewTable
+		err = rows.Scan(&skewTable.dbname, &skewTable.schema, &skewTable.table, &skewTable.slope, &skewTable.size)
 		if err != nil {
 			errs = append(errs, err)
 			continue
 		}
-
-		ch <- prometheus.MustNewConstMetric(skewTableDesc, prometheus.GaugeValue, slope, dbname, schema, table, size)
+		dbTables.skewTables.PushBack(skewTable)
 	}
 
 	return combineErr(errs...)
